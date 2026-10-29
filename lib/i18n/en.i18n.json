@@ -2277,7 +2277,13 @@
     "off": "Off",
     "launchFailed": "Failed to open external player",
     "appNotInstalled": "${name} is not installed",
-    "playInExternalPlayer": "Play in External Player"
+    "playInExternalPlayer": "Play in External Player",
+    "zidooPathMappings": "Zidoo File Paths",
+    "zidooPathMappingsDescription": "Found on the Zidoo's share mounts the first time you play from each folder. Add one only if that fails.",
+    "addZidooPathMapping": "Add Path Mapping",
+    "serverPath": "Folder on the Server",
+    "zidooPath": "Same Folder on the Zidoo",
+    "zidooNoPathMapping": "This video is not on any share the Zidoo has mounted. Mount the share on the Zidoo, or add a path in External Player settings."
   },
   "metadataEdit": {
     "editMetadata": "Edit...",

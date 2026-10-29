@@ -38,6 +38,7 @@ import '../models/transcode_quality_preset.dart';
 import '../navigation/navigation_tabs.dart';
 import '../utils/platform_detector.dart';
 import 'trackers/tracker_constants.dart';
+import 'zidoo_direct_paths.dart';
 import '../profiles/profile.dart';
 import '../theme/mono_theme.dart' show MonoPalette;
 import '../watch_together/services/watch_party_relays.dart';
@@ -1072,6 +1073,15 @@ class SettingsService extends BaseSharedPreferencesService {
     defaultValue: const [],
     encode: (v) => json.encode(v.map((p) => p.toJson()).toList()),
     decode: (raw) => (raw as List).map((e) => ExternalPlayer.fromJson(e as Map<String, dynamic>)).toList(),
+  );
+
+  /// Where the native Zidoo player finds the server's files on the box's own
+  /// share mounts, for "Zidoo Native Player Direct".
+  static final zidooPathMappings = JsonPref<List<ZidooPathMapping>>(
+    'zidoo_path_mappings',
+    defaultValue: const [],
+    encode: (v) => json.encode(v.map((m) => m.toJson()).toList()),
+    decode: (raw) => [for (final entry in raw as List) ?ZidooPathMapping.fromJson(entry)],
   );
   static final mpvPresets = JsonPref<List<MpvPreset>>(
     'mpv_config_presets',

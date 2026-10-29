@@ -560,6 +560,12 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+        <!-- Holds Plezy in the foreground while an external player it handed a
+             video to is in front, so live playback reports keep going. -->
+        <service
+            android:name=".ExternalPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
         <!-- Setting this stops FlutterLoader from appending its half-of-RAM default after
              PlezyActivity's shell args, where it would override the low-RAM cap. PlezyActivity
              always passes the per-device value; this one applies only if another engine
@@ -579,6 +585,9 @@
 
          In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
     <queries>
+        <!-- The native Zidoo player, looked up by component to offer it as an external player. -->
+        <package android:name="com.zidoo.player" />
+        <package android:name="com.android.gallery3d" />
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

@@ -1,6 +1,7 @@
 package com.edde746.plezy
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
 import io.flutter.plugin.common.MethodChannel
@@ -9,6 +10,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.json.JSONObject
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -164,5 +166,93 @@ class ExternalPlayerChannelTest {
     override fun notImplemented() {
       completed = true
     }
+  }
+
+  @Test
+  fun zidooLaunchTargetsThePlayerActivityWithTheSelectedTracks() {
+    val activity = Robolectric.buildActivity(Activity::class.java).get()
+    val channel = ExternalPlayerChannel(activity)
+    val source = ExternalPlayerChannel.Source(
+      Uri.parse("http://plex:32400/library/parts/9808/1775431760/file.mkv?X-Plex-Token=tok"),
+      grantRead = false,
+      fileName = "file.mkv"
+    )
+
+    val intent = channel.buildIntent(
+      source,
+      packageName = null,
+      startPositionMs = 60_000L,
+      title = "Movie",
+      component = ComponentName.unflattenFromString(ExternalPlayerChannel.ZIDOO_PLAYER_COMPONENT),
+      trackIndexes = ExternalPlayerChannel.TrackIndexes(audio = 1, subtitle = 2)
+    )
+
+    assertEquals("com.zidoo.player", intent.component?.packageName)
+    assertEquals("com.zidoo.player.activity.PlayerActivity", intent.component?.className)
+    assertEquals(1, intent.getIntExtra("audio_idx", -1))
+    assertEquals(2, intent.getIntExtra("subtitle_idx", -1))
+    assertEquals(60_000, intent.getIntExtra("position", -1))
+    assertTrue(intent.getBooleanExtra("return_result", false))
+  }
+
+  @Test
+  fun trackIndexesOutsideTheZidooRangesAreLeftOut() {
+    val activity = Robolectric.buildActivity(Activity::class.java).get()
+    val channel = ExternalPlayerChannel(activity)
+    val source = ExternalPlayerChannel.Source(Uri.parse("http://plex/file.mkv"), grantRead = false, fileName = "file.mkv")
+
+    val unset = channel.buildIntent(source, packageName = null, startPositionMs = 0L, title = null)
+    val outOfRange = channel.buildIntent(
+      source,
+      packageName = null,
+      startPositionMs = 0L,
+      title = null,
+      trackIndexes = ExternalPlayerChannel.TrackIndexes(audio = -1, subtitle = 0)
+    )
+
+    assertFalse(unset.hasExtra("audio_idx"))
+    assertFalse(unset.hasExtra("subtitle_idx"))
+    assertFalse(outOfRange.hasExtra("audio_idx"))
+    assertFalse(outOfRange.hasExtra("subtitle_idx"))
+  }
+
+  @Test
+  fun aDirectFileReachesThePlayerAsItsOwnPath() {
+    val activity = Robolectric.buildActivity(Activity::class.java).get()
+    val channel = ExternalPlayerChannel(activity)
+
+    val mounted = channel.directSource("/mnt/smb/192.168.1.10#media/Movies/Heat (1995)/Heat.mkv")
+    val network = channel.directSource("nfs://192.168.1.10/media/Movies/Heat.mkv")
+    val intent = channel.buildIntent(mounted, packageName = null, startPositionMs = 0L, title = "Heat")
+
+    assertEquals("file", mounted.uri.scheme)
+    assertEquals("/mnt/smb/192.168.1.10#media/Movies/Heat (1995)/Heat.mkv", mounted.uri.path)
+    assertEquals("Heat.mkv", mounted.fileName)
+    assertFalse(mounted.grantRead)
+    assertEquals("nfs", network.uri.scheme)
+    assertEquals(mounted.uri, intent.data)
+    assertEquals(0, intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION)
+  }
+
+  @Test
+  fun theLegacyGalleryPlayerOnlyCountsOnAZidoo() {
+    assertTrue(ExternalPlayerChannel.isZidooComponent(ExternalPlayerChannel.ZIDOO_PLAYER_COMPONENT, "Google"))
+    assertTrue(ExternalPlayerChannel.isZidooComponent(ExternalPlayerChannel.ZIDOO_LEGACY_PLAYER_COMPONENT, "ZIDOO"))
+    assertFalse(ExternalPlayerChannel.isZidooComponent(ExternalPlayerChannel.ZIDOO_LEGACY_PLAYER_COMPONENT, "Google"))
+    assertFalse(ExternalPlayerChannel.isZidooComponent("org.videolan.vlc/.StartActivity", "ZIDOO"))
+  }
+
+  @Test
+  fun anOrphanedResultKeepsTheSessionAndWhereThePlayerStopped() {
+    val activity = Robolectric.buildActivity(Activity::class.java).get()
+    val channel = ExternalPlayerChannel(activity)
+    val result = channel.buildResult(Activity.RESULT_OK, Intent().putExtra("position", 754_000))
+
+    val json = JSONObject(channel.orphanedResultJson("{\"serverId\":\"srv\",\"itemId\":\"42\"}", result))
+
+    assertEquals("{\"serverId\":\"srv\",\"itemId\":\"42\"}", json.getString("session"))
+    assertEquals(754_000L, json.getLong("positionMs"))
+    assertFalse(json.has("durationMs"))
+    assertFalse(json.getBoolean("playbackCompleted"))
   }
 }
