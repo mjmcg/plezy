@@ -11,6 +11,7 @@ import '../../focus/focusable_text_field.dart';
 import '../../i18n/strings.g.dart';
 import '../../models/external_player_models.dart';
 import '../../services/settings_service.dart';
+import '../../services/zidoo_direct_paths.dart';
 import '../../utils/dialogs.dart';
 import '../../widgets/expressive_button_group.dart';
 import '../../widgets/focusable_list_tile.dart';
@@ -42,12 +43,14 @@ class ExternalPlayerScreen extends StatelessWidget {
             SettingsService.useExternalPlayer,
             SettingsService.selectedExternalPlayer,
             SettingsService.customExternalPlayers,
+            SettingsService.zidooPathMappings,
           ],
           builder: (context) {
             final svc = SettingsService.instance;
             if (!svc.read(SettingsService.useExternalPlayer)) return const SizedBox.shrink();
             final selected = svc.read(SettingsService.selectedExternalPlayer);
             final custom = svc.read(SettingsService.customExternalPlayers);
+            final mappings = svc.read(SettingsService.zidooPathMappings);
             return Column(
               children: [
                 FutureBuilder<List<ExternalPlayer>>(
@@ -76,6 +79,19 @@ class ExternalPlayerScreen extends StatelessWidget {
                     ),
                   ],
                 ),
+                if (selected.id == KnownPlayers.zidooDirectPlayerId)
+                  SettingsGroup(
+                    title: t.externalPlayer.zidooPathMappings,
+                    children: [
+                      for (final mapping in mappings) _ZidooPathMappingTile(mapping: mapping),
+                      FocusableListTile(
+                        leading: const AppIcon(Symbols.add_rounded, fill: 1),
+                        title: Text(t.externalPlayer.addZidooPathMapping),
+                        subtitle: Text(t.externalPlayer.zidooPathMappingsDescription),
+                        onTap: () => _showAddZidooPathMappingDialog(context),
+                      ),
+                    ],
+                  ),
               ],
             );
           },
@@ -251,6 +267,111 @@ class _AddCustomPlayerDialogState extends State<_AddCustomPlayerDialog> {
               controller: _valueController,
               focusNode: _valueFocusNode,
               decoration: InputDecoration(labelText: label, hintText: hint),
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _saveFocusNode.requestFocus(),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        DialogActionButton(onPressed: () => Navigator.pop(context), label: t.common.cancel),
+        DialogActionButton(focusNode: _saveFocusNode, onPressed: _submit, label: t.common.save, isPrimary: true),
+      ],
+    );
+  }
+}
+
+class _ZidooPathMappingTile extends StatelessWidget {
+  const _ZidooPathMappingTile({required this.mapping});
+
+  final ZidooPathMapping mapping;
+
+  Future<void> _remove() async {
+    final svc = SettingsService.instance;
+    await svc.write(SettingsService.zidooPathMappings, [
+      for (final m in svc.read(SettingsService.zidooPathMappings))
+        if (m != mapping) m,
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FocusableListTile(
+      leading: const AppIcon(Symbols.folder_rounded, fill: 1, size: 32),
+      title: Text(mapping.serverPath),
+      subtitle: Text(mapping.zidooPath),
+      trailing: FocusableButton(
+        onPressed: _remove,
+        autoScroll: false,
+        child: IconButton(icon: const AppIcon(Symbols.delete_rounded, fill: 1, size: 20), onPressed: _remove),
+      ),
+    );
+  }
+}
+
+Future<void> _showAddZidooPathMappingDialog(BuildContext context) async {
+  final mapping = await showScopedDialog<ZidooPathMapping>(
+    context: context,
+    builder: (_) => const _AddZidooPathMappingDialog(),
+  );
+  if (mapping == null) return;
+  final svc = SettingsService.instance;
+  await svc.write(SettingsService.zidooPathMappings, [...svc.read(SettingsService.zidooPathMappings), mapping]);
+}
+
+class _AddZidooPathMappingDialog extends StatefulWidget {
+  const _AddZidooPathMappingDialog();
+
+  @override
+  State<_AddZidooPathMappingDialog> createState() => _AddZidooPathMappingDialogState();
+}
+
+class _AddZidooPathMappingDialogState extends State<_AddZidooPathMappingDialog> {
+  final _serverController = TextEditingController();
+  final _zidooController = TextEditingController();
+  final _zidooFocusNode = FocusNode(debugLabel: 'ZidooPathMappingZidoo');
+  final _saveFocusNode = FocusNode(debugLabel: 'ZidooPathMappingSave');
+
+  @override
+  void dispose() {
+    _zidooFocusNode.dispose();
+    _saveFocusNode.dispose();
+    _serverController.dispose();
+    _zidooController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final serverPath = _serverController.text.trim();
+    final zidooPath = _zidooController.text.trim();
+    if (serverPath.isEmpty || zidooPath.isEmpty) return;
+    Navigator.pop(context, ZidooPathMapping(serverPath: serverPath, zidooPath: zidooPath));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(t.externalPlayer.addZidooPathMapping),
+      content: SizedBox(
+        width: 360,
+        child: Column(
+          mainAxisSize: .min,
+          children: [
+            FocusableTextField(
+              controller: _serverController,
+              decoration: InputDecoration(labelText: t.externalPlayer.serverPath, hintText: '/data/media'),
+              autofocus: true,
+              textInputAction: TextInputAction.next,
+              onSubmitted: (_) => _zidooFocusNode.requestFocus(),
+            ),
+            const SizedBox(height: 16),
+            FocusableTextField(
+              controller: _zidooController,
+              focusNode: _zidooFocusNode,
+              decoration: InputDecoration(
+                labelText: t.externalPlayer.zidooPath,
+                hintText: '/mnt/smb/192.168.1.10#media',
+              ),
               textInputAction: TextInputAction.done,
               onSubmitted: (_) => _saveFocusNode.requestFocus(),
             ),

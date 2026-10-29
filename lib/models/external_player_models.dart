@@ -114,6 +114,10 @@ class PlayerInstallProbe {
   }
 
   Future<bool> schemeHasHandler(String scheme) => _canOpenAppUrl(Uri.parse(scheme));
+
+  /// Android: whether one of the native Zidoo player's activities is
+  /// installed — the same lookup its launch makes.
+  Future<bool> zidooPlayerInstalled() async => (await KnownPlayers.zidooPlayerComponents()).isNotEmpty;
 }
 
 class ExternalPlayer {
@@ -190,6 +194,9 @@ const _tvosBuild = bool.fromEnvironment('TVOS_BUILD');
 /// The tvOS Runner has no url_launcher implementation; it answers the two
 /// handoff questions itself on this channel (Android's `openVideo` shares it).
 const _tvosHandoffChannel = MethodChannel('com.plezy/external_player');
+
+/// The same channel on Android, served by `ExternalPlayerChannel`.
+const _androidHandoffChannel = MethodChannel('com.plezy/external_player');
 
 Future<bool> _canOpenAppUrl(Uri uri) async {
   if (!_tvosBuild) return canLaunchUrl(uri);
@@ -344,6 +351,25 @@ class KnownPlayers {
     return _androidPackageMap[id] ?? const [];
   }
 
+  /// The native Zidoo player. Launched by component rather than package, with
+  /// the track selection its intent API takes (see `ExternalPlayerChannel`).
+  static const zidooPlayerId = 'zidoo';
+
+  /// The native Zidoo player handed the file itself, at the box's own mount
+  /// of the server's share, instead of a stream from the server.
+  static const zidooDirectPlayerId = 'zidoo_direct';
+
+  /// Whether [id] is either native Zidoo player.
+  static bool isZidooPlayer(String id) => id == zidooPlayerId || id == zidooDirectPlayerId;
+
+  /// The installed Zidoo player activities (`package/class`), most current
+  /// first; empty off a Zidoo, or where the lookup is unavailable.
+  static Future<List<String>> zidooPlayerComponents() async {
+    if (!Platform.isAndroid) return const [];
+    final components = await _androidHandoffChannel.invokeListMethod<String>('zidooPlayerComponents');
+    return components ?? const [];
+  }
+
   static List<String> androidPackageCandidates(ExternalPlayer player) {
     final knownPackages = _androidPackageCandidatesForId(player.id);
     if (knownPackages.isNotEmpty) return knownPackages;
@@ -396,6 +422,20 @@ class KnownPlayers {
       iconAsset: 'assets/player_icons/mx_player.svg',
       isAvailable: Platform.isAndroid,
       launch: (url) => _launchAndroidIntentCandidates(url, _androidPackageCandidatesForId('mx_player')),
+    ),
+    ExternalPlayer(
+      id: zidooPlayerId,
+      name: 'Zidoo Native Player',
+      isAvailable: Platform.isAndroid,
+      // Android launches go through ExternalPlayerService's native intent,
+      // which targets the player's activity; this is only the fallback.
+      launch: (url) => _launchAndroidIntentCandidates(url, const ['com.zidoo.player']),
+    ),
+    ExternalPlayer(
+      id: zidooDirectPlayerId,
+      name: 'Zidoo Native Player Direct',
+      isAvailable: Platform.isAndroid,
+      launch: (url) => _launchAndroidIntentCandidates(url, const ['com.zidoo.player']),
     ),
     ExternalPlayer(
       id: 'just_player',
@@ -480,10 +520,10 @@ class KnownPlayers {
   ///
   /// Detection forks `sh` or `where.exe` and calls out over platform channels,
   /// so it is asynchronous and memoised: it runs once per process and a player
-  /// installed while Plezy is running only appears after a restart. Android is
-  /// the one platform left unprobed — where there is no reliable check the
-  /// player stays listed, because hiding a working player is worse than
-  /// listing a missing one.
+  /// installed while Plezy is running only appears after a restart. On Android
+  /// only the Zidoo player is probed, since it exists on one device family —
+  /// where there is no reliable check the player stays listed, because hiding
+  /// a working player is worse than listing a missing one.
   static Future<List<ExternalPlayer>> getForCurrentPlatform() {
     return _installedPlayers ??= _resolveForCurrentPlatform();
   }
@@ -523,6 +563,11 @@ class KnownPlayers {
         detectors['vlc'] = () => probe.schemeHasHandler('vlc://');
         detectors['infuse'] = () => probe.schemeHasHandler('infuse://');
         if (!_tvosBuild) detectors['outplayer'] = () => probe.schemeHasHandler('outplayer://');
+      case 'android':
+        // Both Zidoo entries are the same player: look it up once.
+        final zidooInstalled = probe.zidooPlayerInstalled();
+        detectors[zidooPlayerId] = () => zidooInstalled;
+        detectors[zidooDirectPlayerId] = () => zidooInstalled;
     }
     if (detectors.isEmpty) return supported;
 

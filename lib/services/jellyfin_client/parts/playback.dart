@@ -498,6 +498,8 @@ mixin _JellyfinPlaybackMethods on _JellyfinClientInternals {
       subtitles: [
         for (final sidecar in _buildExternalSubtitles(item.id, bundle.selectedSourceId, mediaInfo)) sidecar.track,
       ],
+      audioTracks: mediaInfo.audioTracks,
+      subtitleTracks: mediaInfo.subtitleTracks,
     );
   }
 

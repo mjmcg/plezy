@@ -115,7 +115,27 @@ class ExternalPlaybackTarget {
   /// files: the external player gets that one file, on that file's clock.
   final MediaPartTimeline? partTimeline;
 
-  const ExternalPlaybackTarget({required this.url, this.subtitles = const [], this.partTimeline});
+  /// The file's audio and subtitle rows with the server's selection, for
+  /// players that take a track to start on (the native Zidoo player).
+  final List<MediaAudioTrack> audioTracks;
+  final List<MediaSubtitleTrack> subtitleTracks;
+
+  /// The file's Plex part id, where a track picked in the player is saved.
+  final int? partId;
+
+  /// The file's path on the media server, where a player that reads the
+  /// server's share itself finds it. Null where the server hides it.
+  final String? filePath;
+
+  const ExternalPlaybackTarget({
+    required this.url,
+    this.subtitles = const [],
+    this.partTimeline,
+    this.audioTracks = const [],
+    this.subtitleTracks = const [],
+    this.partId,
+    this.filePath,
+  });
 }
 
 /// Reason the transcode branch fell back to direct play.

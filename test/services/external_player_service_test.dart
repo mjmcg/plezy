@@ -8,6 +8,7 @@ import 'package:plezy/media/media_part.dart';
 import 'package:plezy/media/media_part_timeline.dart';
 import 'package:plezy/media/media_kind.dart';
 import 'package:plezy/media/media_server_client.dart';
+import 'package:plezy/media/media_source_info.dart';
 import 'package:plezy/services/external_player_service.dart';
 import 'package:plezy/services/deep_links/deep_link.dart';
 import 'package:plezy/services/jellyfin_api_cache.dart';
@@ -488,6 +489,127 @@ void main() {
     test('other kinds get no name', () {
       final item = testMediaItem(kind: MediaKind.clip, title: 'Trailer');
       expect(ExternalPlayerService.playerFilename(item, plexUrl), isNull);
+    });
+  });
+
+  group('Zidoo track indexes', () {
+    MediaAudioTrack audio(int id, int index, {bool selected = false}) =>
+        MediaAudioTrack(id: id, index: index, selected: selected);
+    MediaSubtitleTrack subtitle(int id, int? index, {bool selected = false, String? key}) =>
+        MediaSubtitleTrack(id: id, index: index, selected: selected, forced: false, key: key);
+
+    test('audio counts from 0 and subtitles from 1 among the file streams', () {
+      final indexes = ExternalPlayerService.zidooTrackIndexes(
+        [audio(1, 1), audio(2, 2, selected: true)],
+        [subtitle(3, 3), subtitle(4, 4), subtitle(5, 5, selected: true)],
+      );
+
+      expect(indexes.audio, 1);
+      expect(indexes.subtitle, 3);
+    });
+
+    test('rows are counted in stream order, not list order', () {
+      final indexes = ExternalPlayerService.zidooTrackIndexes(
+        [audio(2, 2, selected: true), audio(1, 1)],
+        [subtitle(4, 4, selected: true), subtitle(3, 3)],
+      );
+
+      expect(indexes.audio, 1);
+      expect(indexes.subtitle, 2);
+    });
+
+    test('sidecar subtitles are skipped, and a selected sidecar gets no index', () {
+      final skipped = ExternalPlayerService.zidooTrackIndexes(const [], [
+        subtitle(9, null, key: '/library/streams/9'),
+        subtitle(3, 3, selected: true),
+      ]);
+      final sidecarSelected = ExternalPlayerService.zidooTrackIndexes(const [], [
+        subtitle(3, 3),
+        subtitle(9, null, key: '/library/streams/9', selected: true),
+      ]);
+
+      expect(skipped.subtitle, 1);
+      expect(sidecarSelected.subtitle, isNull);
+    });
+
+    test('a Jellyfin subtitle stored in the file but delivered externally still counts', () {
+      final indexes = ExternalPlayerService.zidooTrackIndexes(const [], [
+        MediaSubtitleTrack(id: 3, index: 3, selected: false, forced: false, key: '/sub/3', usesExternalDelivery: true),
+        subtitle(4, 4, selected: true),
+      ]);
+
+      expect(indexes.subtitle, 2);
+    });
+
+    test('nothing selected leaves the choice to the player', () {
+      final indexes = ExternalPlayerService.zidooTrackIndexes([audio(1, 1)], [subtitle(2, 2)]);
+
+      expect(indexes.audio, isNull);
+      expect(indexes.subtitle, isNull);
+    });
+  });
+
+  group('a result that outlived its launch', () {
+    test('the session survives the trip through JSON', () {
+      const session = ExternalHandoffSession(
+        serverId: 'srv',
+        itemId: 'item-1',
+        itemDurationMs: 5400000,
+        partStartMs: 3000000,
+        partEndMs: 5400000,
+      );
+
+      final decoded = ExternalHandoffSession.fromJson(session.toJson())!;
+
+      expect(decoded.serverId, 'srv');
+      expect(decoded.itemId, 'item-1');
+      expect(decoded.itemDurationMs, 5400000);
+      expect(decoded.partStartMs, 3000000);
+      expect(decoded.partEndMs, 5400000);
+    });
+
+    test('an unreadable session is dropped', () {
+      expect(ExternalHandoffSession.fromJson('not json'), isNull);
+      expect(ExternalHandoffSession.fromJson('{"itemId":"1"}'), isNull);
+    });
+
+    test('an item without a server cannot be recovered', () {
+      final item = testMediaItem(id: 'item-1', kind: MediaKind.movie, durationMs: 1000);
+
+      expect(ExternalHandoffSession.forItem(item, null), isNull);
+    });
+
+    test('a single file reports the player position against the item runtime', () {
+      final session = ExternalHandoffSession.forItem(_item(durationMs: 6000000), null)!;
+
+      expect(ExternalPlayerService.handoffProgress(session: session, positionMs: 1234000), (
+        positionMs: 1234000,
+        durationMs: 6000000,
+      ));
+    });
+
+    test('a stacked file reports on the item clock', () {
+      final timeline = MediaPartTimeline.fromParts(const [
+        MediaPart(id: '11', durationMs: 3000000),
+        MediaPart(id: '12', durationMs: 2400000),
+      ], currentIndex: 1)!;
+      final session = ExternalHandoffSession.forItem(_item(durationMs: 5400000), timeline)!;
+
+      expect(ExternalPlayerService.handoffProgress(session: session, positionMs: 60000), (
+        positionMs: 3060000,
+        durationMs: 5400000,
+      ));
+      expect(ExternalPlayerService.handoffProgress(session: session, playbackCompleted: true), (
+        positionMs: 5400000,
+        durationMs: 5400000,
+      ));
+    });
+
+    test('no position, or an error, reports nothing', () {
+      final session = ExternalHandoffSession.forItem(_item(durationMs: 6000000), null)!;
+
+      expect(ExternalPlayerService.handoffProgress(session: session), isNull);
+      expect(ExternalPlayerService.handoffProgress(session: session, positionMs: 1000, playbackError: true), isNull);
     });
   });
 }

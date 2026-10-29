@@ -104,10 +104,11 @@ void main() {
       expect(probe.runs, isEmpty);
     });
 
-    test('platforms without a detector probe nothing', () async {
+    test('Android asks only whether the Zidoo player is installed', () async {
       final probe = _FakeProbe(operatingSystem: 'android');
       await _resolveWith(probe);
 
+      expect(probe.zidooLookups, 1);
       expect(probe.runs, isEmpty);
       expect(probe.bundleLookups, isEmpty);
       expect(probe.schemeLookups, isEmpty);
@@ -312,6 +313,7 @@ class _FakeProbe extends PlayerInstallProbe {
   final List<List<String>> runs = [];
   final List<String> bundleLookups = [];
   final List<String> schemeLookups = [];
+  int zidooLookups = 0;
 
   @override
   final Map<String, String> environment;
@@ -333,6 +335,13 @@ class _FakeProbe extends PlayerInstallProbe {
       default:
         fail('unexpected probe subprocess: $executable $arguments');
     }
+  }
+
+  @override
+  Future<bool> zidooPlayerInstalled() async {
+    zidooLookups++;
+    if (failEveryLookup) throw MissingPluginException('no external player channel');
+    return _everything;
   }
 
   @override
