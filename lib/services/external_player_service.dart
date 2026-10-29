@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import '../media/ids.dart';
 import 'dart:io';
 
@@ -11,11 +12,13 @@ import '../media/media_item.dart';
 import '../media/media_kind.dart';
 import '../media/media_part_timeline.dart';
 import '../media/media_server_client.dart';
+import '../media/media_source_info.dart';
 import '../media/watch_progress.dart';
 import '../models/external_player_models.dart';
 import '../mpv/models.dart';
 import '../utils/app_logger.dart';
 import '../utils/platform_detector.dart';
+import '../utils/session_identifier.dart';
 import '../utils/snackbar_helper.dart';
 import '../utils/watch_state_notifier.dart';
 import '../i18n/strings.g.dart';
@@ -23,7 +26,10 @@ import 'deep_links/deep_link.dart';
 import 'settings_service.dart';
 import 'offline_watch_sync_service.dart';
 import 'playback_initialization_service.dart';
+import 'plex_client.dart';
 import 'trackers/tracker_coordinator.dart';
+import 'zidoo_direct_paths.dart';
+import 'zidoo_now_playing.dart';
 
 const _externalPlayerChannel = MethodChannel('com.plezy/external_player');
 
@@ -50,6 +56,19 @@ class _ExternalPlayerLaunchResult {
       durationMs: _asInt(map['durationMs']),
       playbackCompleted: map['playbackCompleted'] == true,
       playbackError: map['playbackError'] == true,
+    );
+  }
+
+  /// This result, with [positionMs] standing in for a position the player
+  /// did not report. A finished playback keeps its own end position.
+  _ExternalPlayerLaunchResult withFallbackPosition(int? positionMs) {
+    if (this.positionMs != null || positionMs == null || playbackCompleted) return this;
+    return _ExternalPlayerLaunchResult(
+      launched: launched,
+      positionMs: positionMs,
+      durationMs: durationMs,
+      playbackCompleted: playbackCompleted,
+      playbackError: playbackError,
     );
   }
 
@@ -81,6 +100,70 @@ class _CallbackSession {
   final OfflineWatchSyncService? offlineWatchService;
   final String? mediaSourceId;
   final MediaPartTimeline? partTimeline;
+}
+
+/// What an Android launch needs to report its result, kept by the native side
+/// until the player answers. When the device reclaims Plezy while the player
+/// is in front, the answer reaches a fresh process; this is all that process
+/// knows about the item.
+@visibleForTesting
+class ExternalHandoffSession {
+  const ExternalHandoffSession({
+    required this.serverId,
+    required this.itemId,
+    this.itemDurationMs,
+    this.partStartMs,
+    this.partEndMs,
+  });
+
+  final String serverId;
+  final String itemId;
+
+  /// The item's runtime; for a stacked item, all of its files together.
+  final int? itemDurationMs;
+
+  /// The handed-over file's span on a stacked item; null for a single file.
+  final int? partStartMs;
+  final int? partEndMs;
+
+  static ExternalHandoffSession? forItem(MediaItem item, MediaPartTimeline? partTimeline) {
+    final serverId = item.serverId;
+    if (serverId == null || serverId.isEmpty) return null;
+    final part = partTimeline?.current;
+    return ExternalHandoffSession(
+      serverId: serverId,
+      itemId: item.id,
+      itemDurationMs: partTimeline?.duration.inMilliseconds ?? item.durationMs,
+      partStartMs: part?.start.inMilliseconds,
+      partEndMs: part?.end.inMilliseconds,
+    );
+  }
+
+  String toJson() => jsonEncode({
+    'serverId': serverId,
+    'itemId': itemId,
+    'itemDurationMs': ?itemDurationMs,
+    'partStartMs': ?partStartMs,
+    'partEndMs': ?partEndMs,
+  });
+
+  static ExternalHandoffSession? fromJson(String json) {
+    try {
+      final map = jsonDecode(json) as Map<String, dynamic>;
+      final serverId = map['serverId'];
+      final itemId = map['itemId'];
+      if (serverId is! String || itemId is! String) return null;
+      return ExternalHandoffSession(
+        serverId: serverId,
+        itemId: itemId,
+        itemDurationMs: map['itemDurationMs'] as int?,
+        partStartMs: map['partStartMs'] as int?,
+        partEndMs: map['partEndMs'] as int?,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
 /// How playback in an x-callback-url player ended: the `<result>` of its
@@ -129,6 +212,10 @@ class ExternalPlayerService {
     try {
       String resolvedUrl;
       var subtitles = const <SubtitleTrack>[];
+      var audioTracks = const <MediaAudioTrack>[];
+      var subtitleTracks = const <MediaSubtitleTrack>[];
+      int? partId;
+      String? serverFilePath;
       // An external player is handed one file. For an item stacked across
       // several files that is one part, on that part's clock.
       MediaPartTimeline? partTimeline;
@@ -157,6 +244,10 @@ class ExternalPlayerService {
         resolvedUrl = target.url;
         subtitles = target.subtitles;
         partTimeline = target.partTimeline;
+        audioTracks = target.audioTracks;
+        subtitleTracks = target.subtitleTracks;
+        partId = target.partId;
+        serverFilePath = target.filePath;
       } else {
         appLogger.e('ExternalPlayerService.launch requires either videoUrl or client+metadata');
         return false;
@@ -190,18 +281,89 @@ class ExternalPlayerService {
           );
           if (!context.mounted || !current()) return false;
         }
+        // The native Zidoo player can be followed while it plays, through
+        // the box's control API, so the server shows it as playing.
+        ZidooNowPlayingReporter? reporter;
+        String? playSessionId;
+        var directFile = false;
+        if (KnownPlayers.isZidooPlayer(player.id) && client != null && metadata != null) {
+          playSessionId = generateSessionIdentifier();
+          if (player.id == KnownPlayers.zidooDirectPlayerId && videoUrl == null) {
+            // The box reads the file from its own mount of the server's
+            // share, so no server address or token reaches the player.
+            final directPath = serverFilePath == null ? null : await _zidooDirectPath(serverFilePath, settings);
+            if (!context.mounted || !current()) return false;
+            if (directPath == null) {
+              appLogger.w('Zidoo direct: no path mapping holds ${serverFilePath ?? 'a file the server did not name'}');
+              if (context.mounted) showErrorSnackBar(context, t.externalPlayer.zidooNoPathMapping);
+              return false;
+            }
+            appLogger.i('Zidoo direct: $serverFilePath -> $directPath');
+            resolvedUrl = directPath;
+            directFile = true;
+            // The player finds subtitle files beside the video itself, and
+            // the server's links to them would carry its token.
+            subtitles = const [];
+          } else if (client is PlexClient && videoUrl == null) {
+            // The player shows its URL on screen and keeps it in its
+            // history, so it gets a token that only works on this server
+            // and soon lapses rather than the account's own.
+            final transientToken = await client.createTransientToken();
+            if (!context.mounted || !current()) return false;
+            if (transientToken == null) {
+              appLogger.w('Handing the Zidoo player this app\'s own Plex token: the server issued no transient one');
+            } else {
+              subtitles = [
+                for (final track in subtitles)
+                  track.uri == null ? track : track.copyWith(uri: plexUrlWithToken(track.uri!, transientToken)),
+              ];
+            }
+            resolvedUrl = plexStreamUrlWithIdentity(
+              resolvedUrl,
+              client.streamHeaders,
+              playSessionId,
+              token: transientToken,
+            );
+          }
+          reporter = ZidooNowPlayingReporter(
+            client: client,
+            metadata: metadata,
+            playSessionId: playSessionId,
+            mediaSourceId: mediaSourceId,
+            partStart: partTimeline?.current.start ?? Duration.zero,
+            itemDuration:
+                partTimeline?.duration ??
+                (metadata.durationMs == null ? null : Duration(milliseconds: metadata.durationMs!)),
+            audioTracks: audioTracks,
+            subtitleTracks: subtitleTracks,
+            persistTrack: _zidooTrackPersister(client, partId, settings.read(SettingsService.rememberTrackSelections)),
+          );
+        }
         onHandoffPending?.call();
-        final launchResult = await _launchAndroidNative(
-          resolvedUrl,
-          player,
-          context,
-          metadata: metadata,
-          startPosition: startPosition,
-          subtitles: subtitles,
-        );
+        reporter?.start();
+        _ExternalPlayerLaunchResult launchResult;
+        try {
+          launchResult = await _launchAndroidNative(
+            resolvedUrl,
+            player,
+            context,
+            metadata: metadata,
+            startPosition: startPosition,
+            subtitles: subtitles,
+            audioTracks: audioTracks,
+            subtitleTracks: subtitleTracks,
+            session: metadata == null ? null : ExternalHandoffSession.forItem(metadata, partTimeline),
+            keepAlive: reporter != null,
+            directFile: directFile,
+          );
+        } finally {
+          await reporter?.stop();
+        }
+        if (reporter != null) launchResult = launchResult.withFallbackPosition(reporter.lastFilePositionMs);
         if (launchResult.launched && current()) onLaunched?.call();
+        var closedSession = false;
         if (launchResult.launched && metadata != null && current()) {
-          await _reportExternalProgress(
+          closedSession = await _reportExternalProgress(
             launchResult,
             metadata: metadata,
             client: client,
@@ -209,8 +371,10 @@ class ExternalPlayerService {
             mediaSourceId: mediaSourceId,
             partTimeline: partTimeline,
             isLaunchCurrent: current,
+            playSessionId: playSessionId,
           );
         }
+        if (!closedSession) await reporter?.closeSession();
         return launchResult.launched;
       }
 
@@ -464,15 +628,34 @@ class ExternalPlayerService {
     MediaItem? metadata,
     Duration? startPosition,
     List<SubtitleTrack> subtitles = const [],
+    List<MediaAudioTrack> audioTracks = const [],
+    List<MediaSubtitleTrack> subtitleTracks = const [],
+    ExternalHandoffSession? session,
+    bool keepAlive = false,
+    bool directFile = false,
   }) async {
     try {
-      final packages = player.id == 'system_default' ? const <String>[] : KnownPlayers.androidPackageCandidates(player);
+      final isZidoo = KnownPlayers.isZidooPlayer(player.id);
+      final packages = player.id == 'system_default' || isZidoo
+          ? const <String>[]
+          : KnownPlayers.androidPackageCandidates(player);
+      final components = isZidoo ? await KnownPlayers.zidooPlayerComponents() : const <String>[];
+      if (isZidoo && components.isEmpty) {
+        throw PlatformException(code: 'APP_NOT_FOUND', message: 'The Zidoo player is not installed');
+      }
+      final tracks = isZidoo ? zidooTrackIndexes(audioTracks, subtitleTracks) : null;
       final result = await _externalPlayerChannel.invokeMapMethod<String, Object?>('openVideo', {
         'filePath': url,
         if (metadata?.title?.trim().isNotEmpty == true) 'title': metadata!.title!.trim(),
         if (startPosition != null && startPosition > Duration.zero) 'startPositionMs': startPosition.inMilliseconds,
         if (packages.isNotEmpty) 'packages': packages,
+        if (components.isNotEmpty) 'components': components,
         if (subtitles.isNotEmpty) 'subtitles': [for (final track in subtitles) ?_subtitleArgument(track)],
+        'audioIndex': ?tracks?.audio,
+        'subtitleIndex': ?tracks?.subtitle,
+        'session': ?session?.toJson(),
+        if (keepAlive) 'keepAlive': true,
+        if (directFile) 'directFile': true,
       });
       return _ExternalPlayerLaunchResult.fromMap(result);
     } on PlatformException catch (e) {
@@ -483,6 +666,171 @@ class ExternalPlayerService {
       }
       return const _ExternalPlayerLaunchResult(launched: false);
     }
+  }
+
+  /// The native Zidoo player's `audio_idx` (from 0) and `subtitle_idx` (from
+  /// 1) for the server-selected rows: positions among the file's own audio
+  /// and subtitle streams, in stream order. Sidecar rows are not in the file
+  /// the player opens, so they are skipped, and a selected sidecar subtitle
+  /// gets no index. Null where nothing is selected, which leaves the choice
+  /// to the player.
+  @visibleForTesting
+  static ({int? audio, int? subtitle}) zidooTrackIndexes(
+    List<MediaAudioTrack> audioTracks,
+    List<MediaSubtitleTrack> subtitleTracks,
+  ) {
+    final audioIndex = zidooAudioOrder(audioTracks).indexWhere((t) => t.selected);
+    final subtitleIndex = zidooSubtitleOrder(subtitleTracks).indexWhere((t) => t.selected);
+    return (audio: audioIndex < 0 ? null : audioIndex, subtitle: subtitleIndex < 0 ? null : subtitleIndex + 1);
+  }
+
+  /// [url], a Plex stream handed to an external player, carrying this app's
+  /// `X-Plex-*` identity from [streamHeaders] and the playback's
+  /// [sessionIdentifier] in its query, since the player sends no headers of
+  /// its own. The server then ties the player's download to the session the
+  /// live reports open, so its dashboard shows the stream's bandwidth under
+  /// this app. A [token] replaces the URL's own.
+  @visibleForTesting
+  static String plexStreamUrlWithIdentity(
+    String url,
+    Map<String, String> streamHeaders,
+    String sessionIdentifier, {
+    String? token,
+  }) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme || !uri.scheme.startsWith('http')) return url;
+    final query = Map<String, String>.from(uri.queryParameters);
+    for (final MapEntry(:key, :value) in streamHeaders.entries) {
+      if (key.startsWith('X-Plex-') && key != _plexTokenParam) query.putIfAbsent(key, () => value);
+    }
+    query['X-Plex-Session-Identifier'] = sessionIdentifier;
+    if (token != null) query[_plexTokenParam] = token;
+    return uri.replace(queryParameters: query).toString();
+  }
+
+  /// [url] with [token] in place of the Plex token in its query; unchanged
+  /// when it carries none.
+  @visibleForTesting
+  static String plexUrlWithToken(String url, String token) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.queryParameters.containsKey(_plexTokenParam)) return url;
+    return uri.replace(queryParameters: {...uri.queryParameters, _plexTokenParam: token}).toString();
+  }
+
+  static const _plexTokenParam = 'X-Plex-Token';
+
+  /// Where the Zidoo box reads [serverFile] through its own share mounts:
+  /// by a saved mapping, else by finding the file on the mounted shares and
+  /// saving the mapping that found it, for the files that follow.
+  static Future<String?> _zidooDirectPath(String serverFile, SettingsService settings) async {
+    final mappings = settings.read(SettingsService.zidooPathMappings);
+    final mapped = zidooDirectPath(serverFile, mappings);
+    if (mapped != null) return mapped;
+    final api = ZidooPlayerApi();
+    try {
+      final found = await discoverZidooPathMapping(serverFile, api.listFolder);
+      if (found == null) return null;
+      appLogger.i('Zidoo direct: found ${found.serverPath} on the box at ${found.zidooPath}');
+      await settings.write(SettingsService.zidooPathMappings, [
+        ...settings.read(SettingsService.zidooPathMappings),
+        found,
+      ]);
+      return zidooDirectPath(serverFile, [found]);
+    } catch (e) {
+      appLogger.w('Zidoo direct: could not search the box\'s share mounts', error: e);
+      return null;
+    } finally {
+      api.close();
+    }
+  }
+
+  /// Saves a track picked in the native Zidoo player on Plex, per file, when
+  /// the viewer lets track picks be remembered. MediaBrowser servers take the
+  /// pick from the stream indexes on the progress reports instead.
+  static ZidooTrackPersister? _zidooTrackPersister(MediaServerClient client, int? partId, bool remember) {
+    if (!remember || partId == null || client is! PlexClient) return null;
+    return ({int? audioStreamId, int? subtitleStreamId}) async {
+      if (!await client.selectStreams(partId, audioStreamID: audioStreamId, subtitleStreamID: subtitleStreamId)) {
+        throw StateError('Plex did not store the stream selection');
+      }
+    };
+  }
+
+  /// Reports a player result that reached this process after the one that
+  /// launched the player was reclaimed (see [ExternalHandoffSession]). The
+  /// position is queued for [offlineWatchService]'s next sync, which also
+  /// marks the item watched past the server's threshold. Android only; safe
+  /// to call when nothing is waiting.
+  static Future<void> recoverOrphanedResult(OfflineWatchSyncService offlineWatchService) async {
+    if (!Platform.isAndroid) return;
+    final Map<String, Object?>? raw;
+    try {
+      raw = await _externalPlayerChannel.invokeMapMethod<String, Object?>('takeOrphanedResult');
+    } catch (e) {
+      appLogger.w('Could not read an orphaned external player result', error: e);
+      return;
+    }
+    if (raw == null) return;
+    final session = ExternalHandoffSession.fromJson(raw['session'] as String? ?? '');
+    if (session == null) {
+      appLogger.w('Dropping an orphaned external player result without a readable session');
+      return;
+    }
+    final result = _ExternalPlayerLaunchResult.fromMap(raw);
+    final progress = _handoffProgress(result: result, session: session);
+    appLogger.i(
+      'Recovered an external player result for ${session.serverId}:${session.itemId} '
+      '(position ${result.positionMs}, completed ${result.playbackCompleted}) -> ${progress?.positionMs}',
+    );
+    if (progress == null) return;
+    await offlineWatchService.queueProgressUpdate(
+      serverId: ServerId(session.serverId),
+      itemId: session.itemId,
+      viewOffset: progress.positionMs,
+      duration: progress.durationMs,
+    );
+  }
+
+  /// Where [result] leaves the item [session] describes, on the item's
+  /// clock; null when the player reported no usable position.
+  @visibleForTesting
+  static ({int positionMs, int? durationMs})? handoffProgress({
+    required ExternalHandoffSession session,
+    int? positionMs,
+    int? durationMs,
+    bool playbackCompleted = false,
+    bool playbackError = false,
+  }) => _handoffProgress(
+    result: _ExternalPlayerLaunchResult(
+      launched: true,
+      positionMs: positionMs,
+      durationMs: durationMs,
+      playbackCompleted: playbackCompleted,
+      playbackError: playbackError,
+    ),
+    session: session,
+  );
+
+  static ({int positionMs, int? durationMs})? _handoffProgress({
+    required _ExternalPlayerLaunchResult result,
+    required ExternalHandoffSession session,
+  }) {
+    if (result.playbackError) return null;
+    final int? duration;
+    final int? reported;
+    final partStart = session.partStartMs;
+    if (partStart != null) {
+      duration = _positive(session.itemDurationMs);
+      final filePosition = _positive(result.positionMs);
+      reported = filePosition != null
+          ? partStart + filePosition
+          : (result.playbackCompleted ? session.partEndMs : null);
+    } else {
+      duration = _positive(result.durationMs) ?? _positive(session.itemDurationMs);
+      reported = _positive(result.positionMs) ?? (result.playbackCompleted ? duration : null);
+    }
+    if (reported == null) return null;
+    return (positionMs: duration == null ? reported : reported.clamp(0, duration).toInt(), durationMs: duration);
   }
 
   /// One `subtitles` entry for the native intent builder. Local sidecars go
@@ -507,7 +855,10 @@ class ExternalPlayerService {
   /// file's clock and its duration is that file's, so both are mapped onto
   /// the item, and playing out a file with another after it leaves the item
   /// at the next file instead of finished.
-  static Future<void> _reportExternalProgress(
+  ///
+  /// [playSessionId] names the server session live reports opened while the
+  /// player ran, if any. Returns whether a stopped report was sent for it.
+  static Future<bool> _reportExternalProgress(
     _ExternalPlayerLaunchResult result, {
     required MediaItem metadata,
     required MediaServerClient? client,
@@ -515,35 +866,34 @@ class ExternalPlayerService {
     String? mediaSourceId,
     MediaPartTimeline? partTimeline,
     bool Function()? isLaunchCurrent,
+    String? playSessionId,
   }) async {
     bool current() => isLaunchCurrent?.call() ?? true;
-    if (!current()) return;
+    if (!current()) return false;
     if (result.playbackError) {
       appLogger.d('External player returned an error result for ${metadata.id}; skipping progress sync');
-      return;
+      return false;
     }
 
-    final int? durationMs;
-    final int? reportedPositionMs;
-    if (partTimeline != null) {
-      final part = partTimeline.current;
-      durationMs = partTimeline.duration.inMilliseconds;
-      final filePositionMs = _positive(result.positionMs);
-      reportedPositionMs = filePositionMs != null
-          ? part.start.inMilliseconds + filePositionMs
-          : (result.playbackCompleted ? part.end.inMilliseconds : null);
-    } else {
-      durationMs = _positive(result.durationMs) ?? _positive(metadata.durationMs);
-      reportedPositionMs = _positive(result.positionMs) ?? (result.playbackCompleted ? durationMs : null);
-    }
-    if (reportedPositionMs == null) return;
+    final part = partTimeline?.current;
+    final progress = _handoffProgress(
+      result: result,
+      session: ExternalHandoffSession(
+        serverId: metadata.serverId ?? '',
+        itemId: metadata.id,
+        itemDurationMs: partTimeline?.duration.inMilliseconds ?? metadata.durationMs,
+        partStartMs: part?.start.inMilliseconds,
+        partEndMs: part?.end.inMilliseconds,
+      ),
+    );
+    if (progress == null) return false;
 
-    final positionMs = durationMs == null ? reportedPositionMs : reportedPositionMs.clamp(0, durationMs).toInt();
-    final position = Duration(milliseconds: positionMs);
+    final position = Duration(milliseconds: progress.positionMs);
+    final durationMs = progress.durationMs;
     final duration = durationMs == null ? null : Duration(milliseconds: durationMs);
     if (client == null) {
       await _queueExternalProgress(metadata, offlineWatchService, position: position, duration: duration);
-      return;
+      return false;
     }
 
     var startedSucceeded = false;
@@ -552,6 +902,7 @@ class ExternalPlayerService {
         itemId: metadata.id,
         position: position,
         duration: duration,
+        playSessionId: playSessionId,
         playMethod: 'DirectPlay',
         mediaSourceId: mediaSourceId,
       );
@@ -560,23 +911,24 @@ class ExternalPlayerService {
       appLogger.d('External player progress: started call failed (continuing)', error: e);
     }
 
-    if (!current()) return;
+    if (!current()) return false;
     try {
       await client.reportPlaybackStopped(
         itemId: metadata.id,
         position: position,
         duration: duration,
+        playSessionId: playSessionId,
         mediaSourceId: mediaSourceId,
       );
     } catch (e) {
       appLogger.w('Failed to sync external player progress for ${metadata.id}', error: e);
-      if (!current()) return;
+      if (!current()) return true;
       await _queueExternalProgress(metadata, offlineWatchService, position: position, duration: duration);
-      return;
+      return true;
     }
 
-    if (!current()) return;
-    if (duration == null) return;
+    if (!current()) return true;
+    if (duration == null) return true;
 
     WatchStateNotifier().notifyProgress(
       item: metadata,
@@ -600,12 +952,13 @@ class ExternalPlayerService {
         // local watch event there to avoid double-scrobbling via the Trakt
         // plugin (#1287). Plex still issues the explicit server call.
         await client.markWatchedFromPlaybackStop(metadata);
-        if (!current()) return;
+        if (!current()) return true;
         unawaited(TrackerCoordinator.instance.markWatched(metadata, client));
       } catch (e) {
         appLogger.w('Failed to mark external playback watched for ${metadata.id}', error: e);
       }
     }
+    return true;
   }
 
   @visibleForTesting

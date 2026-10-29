@@ -17,6 +17,7 @@ import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 import '../i18n/strings.g.dart';
 import '../services/app_exit_service.dart';
+import '../services/external_player_service.dart';
 import '../services/tvos_system_navigation_service.dart';
 import '../services/update_service.dart';
 import '../utils/app_logger.dart';
@@ -747,7 +748,11 @@ class _MainScreenState extends State<MainScreen>
         lp.initialize(mp.aggregationService);
         await lp.loadLibraries();
         if (!mounted) return;
-        context.read<OfflineWatchSyncService>().onServersConnected();
+        final offlineWatchSync = context.read<OfflineWatchSyncService>();
+        // Queued ahead of the startup sync, which then sends it.
+        await ExternalPlayerService.recoverOrphanedResult(offlineWatchSync);
+        if (!mounted) return;
+        offlineWatchSync.onServersConnected();
         unawaited(context.read<DownloadProvider>().refreshMetadataFromCache());
         _resumeQueuedDownloadsForServers(
           mp.onlineServerIds.toSet(),

@@ -5423,6 +5423,24 @@ class Translations$externalPlayer$en {
 
 	/// en: 'Play in External Player'
 	String get playInExternalPlayer => 'Play in External Player';
+
+	/// en: 'Zidoo File Paths'
+	String get zidooPathMappings => 'Zidoo File Paths';
+
+	/// en: 'Found on the Zidoo's share mounts the first time you play from each folder. Add one only if that fails.'
+	String get zidooPathMappingsDescription => 'Found on the Zidoo\'s share mounts the first time you play from each folder. Add one only if that fails.';
+
+	/// en: 'Add Path Mapping'
+	String get addZidooPathMapping => 'Add Path Mapping';
+
+	/// en: 'Folder on the Server'
+	String get serverPath => 'Folder on the Server';
+
+	/// en: 'Same Folder on the Zidoo'
+	String get zidooPath => 'Same Folder on the Zidoo';
+
+	/// en: 'This video is not on any share the Zidoo has mounted. Mount the share on the Zidoo, or add a path in External Player settings.'
+	String get zidooNoPathMapping => 'This video is not on any share the Zidoo has mounted. Mount the share on the Zidoo, or add a path in External Player settings.';
 }
 
 // Path: metadataEdit
@@ -10203,6 +10221,12 @@ extension on Translations {
 			'externalPlayer.launchFailed' => 'Failed to open external player',
 			'externalPlayer.appNotInstalled' => ({required Object name}) => '${name} is not installed',
 			'externalPlayer.playInExternalPlayer' => 'Play in External Player',
+			'externalPlayer.zidooPathMappings' => 'Zidoo File Paths',
+			'externalPlayer.zidooPathMappingsDescription' => 'Found on the Zidoo\'s share mounts the first time you play from each folder. Add one only if that fails.',
+			'externalPlayer.addZidooPathMapping' => 'Add Path Mapping',
+			'externalPlayer.serverPath' => 'Folder on the Server',
+			'externalPlayer.zidooPath' => 'Same Folder on the Zidoo',
+			'externalPlayer.zidooNoPathMapping' => 'This video is not on any share the Zidoo has mounted. Mount the share on the Zidoo, or add a path in External Player settings.',
 			'metadataEdit.editMetadata' => 'Edit...',
 			'metadataEdit.screenTitle' => 'Edit Metadata',
 			'metadataEdit.basicInfo' => 'Basic Info',

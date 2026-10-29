@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Foreground notification while another app plays a video Plezy handed over. -->
+    <string name="external_playback_channel">External player</string>
+    <string name="external_playback_text">Reporting playback to your server</string>
+</resources>

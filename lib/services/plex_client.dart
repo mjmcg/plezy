@@ -2216,6 +2216,23 @@ class PlexClient
     }
   }
 
+  /// A short-lived token to hand another app instead of this client's own,
+  /// from `POST /security/token?type=delegation&scope=all`. It carries the
+  /// same access, but only on this server, and lapses within 48 hours or when
+  /// the server restarts; the server takes no shorter lifetime. Null when the
+  /// server would not issue one.
+  Future<String?> createTransientToken() async {
+    try {
+      final response = await _http.post('/security/token', queryParameters: {'type': 'delegation', 'scope': 'all'});
+      throwIfHttpError(response);
+      final token = _getMediaContainer(response)?['token'];
+      return token is String && token.isNotEmpty ? token : null;
+    } catch (e) {
+      appLogger.w('Could not get a transient token from the server', error: e);
+      return null;
+    }
+  }
+
   /// Keep a paused transcode session alive. Timeline updates alone have not
   /// historically stopped PMS from reaping an idle transcoder, so Plex
   /// clients send this alongside every paused timeline (see OpenPHT's
@@ -5061,7 +5078,18 @@ class PlexClient
       url: playbackData.videoUrl!,
       subtitles: [for (final sidecar in _buildExternalSubtitles(playbackData.mediaInfo)) sidecar.track],
       partTimeline: playbackData.mediaInfo?.partTimeline,
+      audioTracks: playbackData.mediaInfo?.audioTracks ?? const [],
+      subtitleTracks: playbackData.mediaInfo?.subtitleTracks ?? const [],
+      partId: playbackData.mediaInfo?.partId,
+      filePath: _selectedPartFile(playbackData),
     );
+  }
+
+  /// The server-side path of the file [resolveExternalPlayback] hands over.
+  String? _selectedPartFile(PlexVideoPlaybackData data) {
+    final parts = _selectedVersion(data)?.parts;
+    final index = data.mediaInfo?.partIndex ?? 0;
+    return parts != null && index >= 0 && index < parts.length ? parts[index].file : null;
   }
 
   @override

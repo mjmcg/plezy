@@ -3,15 +3,20 @@ package com.edde746.plezy
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Parcelable
+import android.os.StrictMode
 import androidx.core.content.FileProvider
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import org.json.JSONObject
 
 internal class ExternalPlayerChannel(private val activity: Activity) {
   companion object {
@@ -52,8 +57,39 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
     private const val API_SUBS_FILENAME = "subs.filename"
     private const val API_SUBS_ENABLE = "subs.enable"
 
+    // The native Zidoo player's track API (firmware 6.4.42+ on Z9X/Z9X Pro,
+    // 1.1.42+ on the Z9X 8K line): `audio_idx` counts the file's audio
+    // streams from 0, `subtitle_idx` its subtitle streams from 1.
+    private const val API_ZIDOO_AUDIO_INDEX = "audio_idx"
+    private const val API_ZIDOO_SUBTITLE_INDEX = "subtitle_idx"
+
+    /** The Zidoo player activity on current firmware. */
+    internal const val ZIDOO_PLAYER_COMPONENT = "com.zidoo.player/com.zidoo.player.activity.PlayerActivity"
+
+    /**
+     * The player older Zidoo firmware ships. AOSP's Gallery carries the same
+     * activity on other devices, so it only counts on a Zidoo.
+     */
+    internal const val ZIDOO_LEGACY_PLAYER_COMPONENT = "com.android.gallery3d/com.android.gallery3d.app.MovieActivity"
+
     private val positionExtras = arrayOf(API_MX_RESULT_POSITION, API_VLC_RESULT_POSITION)
     private val durationExtras = arrayOf(API_MX_RESULT_DURATION, API_VLC_RESULT_DURATION)
+
+    // A launch outlives this process when the device reclaims it while the
+    // player is in front (Zidoo firmware keeps two background processes), and
+    // the player's result then reaches a fresh activity with no channel call
+    // waiting. Dart's description of the launch is kept here until the result
+    // arrives, and an unclaimed result until Dart takes it.
+    private const val PREFS = "external_player_handoff"
+    private const val KEY_PENDING_SESSION = "pending_session"
+    private const val KEY_ORPHANED_RESULT = "orphaned_result"
+
+    /** Whether [component] names the Zidoo player on [manufacturer]'s device. */
+    internal fun isZidooComponent(component: String, manufacturer: String): Boolean = when (component) {
+      ZIDOO_PLAYER_COMPONENT -> true
+      ZIDOO_LEGACY_PLAYER_COMPONENT -> manufacturer.contains("zidoo", ignoreCase = true)
+      else -> false
+    }
   }
 
   private var pendingResult: MethodChannel.Result? = null
@@ -66,15 +102,71 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
     if (requestCode != REQUEST_CODE) return false
     val result = pendingResult
     pendingResult = null
+    ExternalPlaybackService.stop(activity)
+    val built = buildResult(resultCode, data)
+    val session = prefs().getString(KEY_PENDING_SESSION, null)
     if (result == null) {
-      android.util.Log.w("ExternalPlayerChannel", "Result received without a pending channel call")
+      if (session == null) {
+        android.util.Log.w("ExternalPlayerChannel", "Result received without a pending channel call")
+      } else {
+        android.util.Log.i("ExternalPlayerChannel", "Keeping a player result that outlived its launch for Dart to claim")
+        prefs().edit()
+          .putString(KEY_ORPHANED_RESULT, orphanedResultJson(session, built))
+          .remove(KEY_PENDING_SESSION)
+          .commit()
+      }
     } else {
-      result.success(buildResult(resultCode, data))
+      if (session != null) prefs().edit().remove(KEY_PENDING_SESSION).apply()
+      result.success(built)
     }
     return true
   }
 
+  private fun prefs() = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+  internal fun orphanedResultJson(session: String, result: Map<String, Any?>): String = JSONObject().apply {
+    put("session", session)
+    for (key in listOf("positionMs", "durationMs", "playbackCompleted", "playbackError")) {
+      result[key]?.let { put(key, it) }
+    }
+  }.toString()
+
+  /** The result [onActivityResult] kept for a launch this process never made, once. */
+  private fun takeOrphanedResult(): Map<String, Any?>? {
+    val json = prefs().getString(KEY_ORPHANED_RESULT, null) ?: return null
+    prefs().edit().remove(KEY_ORPHANED_RESULT).apply()
+    return try {
+      val obj = JSONObject(json)
+      mapOf(
+        "session" to obj.getString("session"),
+        "positionMs" to (if (obj.has("positionMs")) obj.getLong("positionMs") else null),
+        "durationMs" to (if (obj.has("durationMs")) obj.getLong("durationMs") else null),
+        "playbackCompleted" to obj.optBoolean("playbackCompleted", false),
+        "playbackError" to obj.optBoolean("playbackError", false)
+      )
+    } catch (error: org.json.JSONException) {
+      android.util.Log.w("ExternalPlayerChannel", "Dropping an unreadable orphaned player result", error)
+      null
+    }
+  }
+
+  /** The Zidoo player activities installed here, most current first. */
+  private fun zidooPlayerComponents(): List<String> = listOf(ZIDOO_PLAYER_COMPONENT, ZIDOO_LEGACY_PLAYER_COMPONENT).filter { component ->
+    isZidooComponent(component, android.os.Build.MANUFACTURER) && activityExists(component)
+  }
+
+  private fun activityExists(component: String): Boolean {
+    val name = ComponentName.unflattenFromString(component) ?: return false
+    return try {
+      activity.packageManager.getActivityInfo(name, 0)
+      true
+    } catch (_: PackageManager.NameNotFoundException) {
+      false
+    }
+  }
+
   fun dispose() {
+    if (pendingResult != null) ExternalPlaybackService.stop(activity)
     pendingResult?.error("ACTIVITY_DESTROYED", "Activity was destroyed while external player was active", null)
     pendingResult = null
   }
@@ -116,20 +208,34 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
     return null
   }
 
-  @Suppress("UNCHECKED_CAST")
   private fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-    if (call.method != "openVideo") {
-      result.notImplemented()
-      return
+    when (call.method) {
+      "openVideo" -> openVideo(call, result)
+      "zidooPlayerComponents" -> result.success(zidooPlayerComponents())
+      "takeOrphanedResult" -> result.success(takeOrphanedResult())
+      else -> result.notImplemented()
     }
+  }
 
+  @Suppress("UNCHECKED_CAST")
+  private fun openVideo(call: MethodCall, result: MethodChannel.Result) {
     val filePath = call.argument<String>("filePath")
     val packageNames = call.argument<List<Any?>>("packages")
       ?.mapNotNull { (it as? String)?.trim()?.takeIf(String::isNotEmpty) }
       ?: emptyList()
+    val components = call.argument<List<Any?>>("components")
+      ?.mapNotNull { (it as? String)?.let(ComponentName::unflattenFromString) }
+      ?: emptyList()
     val title = call.argument<String>("title")?.trim()?.takeIf(String::isNotEmpty)
     val startPositionMs = call.argument<Number>("startPositionMs")?.toLong() ?: 0L
     val subtitleArguments = call.argument<List<Any?>>("subtitles") ?: emptyList()
+    val trackIndexes = TrackIndexes(
+      audio = call.argument<Number>("audioIndex")?.toInt(),
+      subtitle = call.argument<Number>("subtitleIndex")?.toInt()
+    )
+    val session = call.argument<String>("session")
+    val keepAlive = call.argument<Boolean>("keepAlive") == true
+    val directFile = call.argument<Boolean>("directFile") == true
 
     if (filePath == null) {
       result.error("INVALID_ARGUMENT", "filePath is required", null)
@@ -141,30 +247,44 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
     }
 
     try {
-      val source = resolveSource(filePath)
+      val source = if (directFile) directSource(filePath) else resolveSource(filePath)
       val subtitles = subtitleArguments.mapNotNull(::resolveSubtitle)
-      val targetPackages = if (packageNames.isEmpty()) listOf<String?>(null) else packageNames
-      for (packageName in targetPackages) {
+      val targets = buildList {
+        components.forEach { add(LaunchTarget(component = it)) }
+        packageNames.forEach { add(LaunchTarget(packageName = it)) }
+        if (isEmpty()) add(LaunchTarget())
+      }
+      // A stale session from a launch whose result never came is replaced
+      // either way: only the launch below can be answered now.
+      val editor = prefs().edit()
+      if (session == null) editor.remove(KEY_PENDING_SESSION) else editor.putString(KEY_PENDING_SESSION, session)
+      editor.commit()
+      // Started before the player covers Plezy: a foreground service may
+      // not be started from the background on newer Android versions.
+      if (keepAlive) ExternalPlaybackService.start(activity, title)
+      for (target in targets) {
         try {
           pendingResult = result
-          activity.startActivityForResult(
-            buildIntent(source, packageName, startPositionMs, title, subtitles),
-            REQUEST_CODE
-          )
+          val intent =
+            buildIntent(source, target.packageName, startPositionMs, title, subtitles, target.component, trackIndexes)
+          withFileUrisAllowed(source.uri.scheme == "file") { activity.startActivityForResult(intent, REQUEST_CODE) }
           return
         } catch (_: ActivityNotFoundException) {
           pendingResult = null
         }
       }
+      prefs().edit().remove(KEY_PENDING_SESSION).apply()
+      if (keepAlive) ExternalPlaybackService.stop(activity)
 
-      val message = if (packageNames.isEmpty()) {
+      val message = if (components.isEmpty() && packageNames.isEmpty()) {
         "No app found for video"
       } else {
-        "No app found for packages: ${packageNames.joinToString(", ")}"
+        "No app found for: ${(components.map { it.flattenToShortString() } + packageNames).joinToString(", ")}"
       }
       result.error("APP_NOT_FOUND", message, null)
     } catch (error: Exception) {
       pendingResult = null
+      if (keepAlive) ExternalPlaybackService.stop(activity)
       result.error("LAUNCH_FAILED", error.message ?: error.javaClass.simpleName, null)
     }
   }
@@ -172,6 +292,10 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
   internal data class Source(val uri: Uri, val grantRead: Boolean, val fileName: String?)
 
   internal data class Subtitle(val source: Source, val name: String?, val enabled: Boolean)
+
+  internal data class TrackIndexes(val audio: Int? = null, val subtitle: Int? = null)
+
+  private data class LaunchTarget(val packageName: String? = null, val component: ComponentName? = null)
 
   private fun resolveSource(filePath: String): Source {
     if (filePath.startsWith("http://") || filePath.startsWith("https://")) {
@@ -187,6 +311,32 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
     val file = File(path)
     val uri = FileProvider.getUriForFile(activity, "com.edde746.plezy.fileprovider", file)
     return Source(uri, grantRead = true, fileName = file.name)
+  }
+
+  // A file the player reads in place, from a share the box mounts itself
+  // (`/mnt/smb/…`) or by a network URL it opens itself (`smb://`, `nfs://`).
+  // Plezy may not be able to read it, so no content URI can stand in.
+  internal fun directSource(filePath: String): Source {
+    if (filePath.startsWith("/")) {
+      val file = File(filePath)
+      return Source(Uri.fromFile(file), grantRead = false, fileName = file.name)
+    }
+    val uri = Uri.parse(filePath)
+    return Source(uri, grantRead = false, fileName = uri.lastPathSegment)
+  }
+
+  // Android refuses to hand another app a `file://` URI from an app that
+  // targets Android 7 or later. The native Zidoo player opens share mounts
+  // only that way, so the check is off for that one launch.
+  private inline fun withFileUrisAllowed(allowed: Boolean, launch: () -> Unit) {
+    if (!allowed) return launch()
+    val policy = StrictMode.getVmPolicy()
+    StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+    try {
+      launch()
+    } finally {
+      StrictMode.setVmPolicy(policy)
+    }
   }
 
   private fun resolveSubtitle(argument: Any?): Subtitle? {
@@ -209,11 +359,16 @@ internal class ExternalPlayerChannel(private val activity: Activity) {
     packageName: String?,
     startPositionMs: Long,
     title: String?,
-    subtitles: List<Subtitle> = emptyList()
+    subtitles: List<Subtitle> = emptyList(),
+    component: ComponentName? = null,
+    trackIndexes: TrackIndexes = TrackIndexes()
   ): Intent = Intent(Intent.ACTION_VIEW).apply {
     setDataAndType(source.uri, "video/*")
     if (source.grantRead) addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     packageName?.let(::setPackage)
+    component?.let(::setComponent)
+    trackIndexes.audio?.takeIf { it >= 0 }?.let { putExtra(API_ZIDOO_AUDIO_INDEX, it) }
+    trackIndexes.subtitle?.takeIf { it >= 1 }?.let { putExtra(API_ZIDOO_SUBTITLE_INDEX, it) }
     val startPosition = startPositionMs.coerceAtLeast(0).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     if (startPosition > 0) {
       putExtra(API_MX_RESULT_POSITION, startPosition)
